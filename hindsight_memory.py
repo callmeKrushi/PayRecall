@@ -23,9 +23,11 @@ reports whether the API key is present, never its value.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
@@ -36,7 +38,6 @@ from dotenv import load_dotenv
 
 try:  # Imported lazily-tolerant so a missing package gives a clear message.
     from hindsight_client import Hindsight
-    from hindsight_client.hindsight_client import _run_async
     from hindsight_client_api.exceptions import ApiException
 except ImportError as exc:  # pragma: no cover - environment problem
     raise ImportError(
@@ -114,6 +115,31 @@ def load_config(env_path: Path | None = None) -> MemoryConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Background event loop
+# --------------------------------------------------------------------------- #
+# The Hindsight client owns an aiohttp session that is bound to the event loop it
+# first runs on. Streamlit (and any threaded host) calls us from a different thread
+# on every rerun, so every call is executed on one long-lived private loop.
+
+_loop: asyncio.AbstractEventLoop | None = None
+_loop_lock = threading.Lock()
+
+
+def _ensure_loop() -> asyncio.AbstractEventLoop:
+    global _loop
+    with _loop_lock:
+        if _loop is None or _loop.is_closed():
+            _loop = asyncio.new_event_loop()
+            threading.Thread(target=_loop.run_forever, name="payrecall-hindsight-loop", daemon=True).start()
+        return _loop
+
+
+def _run(coro, timeout: float | None = None):
+    """Run a coroutine on the private loop from any thread and return its result."""
+    return asyncio.run_coroutine_threadsafe(coro, _ensure_loop()).result(timeout)
+
+
+# --------------------------------------------------------------------------- #
 # Client lifecycle
 # --------------------------------------------------------------------------- #
 
@@ -149,12 +175,17 @@ def get_client() -> Hindsight:
     global _client, _config
     if _client is None:
         _config = load_config()
-        _client = Hindsight(
-            base_url=_config.base_url,
-            api_key=_config.api_key,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            user_agent="payrecall/0.1",
-        )
+        cfg = _config
+
+        async def _make() -> Hindsight:  # constructed on the private loop
+            return Hindsight(
+                base_url=cfg.base_url,
+                api_key=cfg.api_key,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                user_agent="payrecall/0.1",
+            )
+
+        _client = _run(_make())
         log.info("Hindsight client created for bank %r at %s", _config.bank_id, _config.base_url)
     return _client
 
@@ -170,7 +201,7 @@ def close_memory() -> None:
     global _client, _config
     if _client is not None:
         try:
-            _client.close()
+            _run(_client.aclose())
         except Exception as exc:  # noqa: BLE001 - closing is best-effort
             log.debug("Ignoring error while closing Hindsight client: %s", type(exc).__name__)
         _client = None
@@ -182,8 +213,8 @@ def get_bank_status() -> dict[str, int | None]:
     client = get_client()
     bid = bank_id()
     try:
-        docs = _run_async(client.documents.list_documents(bid, limit=1))
-        mems = client.list_memories(bid, limit=1)
+        docs = _run(client.documents.list_documents(bid, limit=1))
+        mems = _run(client.alist_memories(bid, limit=1))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Bank status check", exc) from exc
     return {
@@ -215,13 +246,13 @@ def initialize_memory(verify: bool = True) -> MemoryStatus:
         return status
 
     try:
-        version = client.get_version()
+        version = _run(client.aget_version())
         status.api_version = getattr(version, "api_version", None)
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Hindsight version check", exc) from exc
 
     try:
-        cfg = client.get_bank_config(_config.bank_id)
+        cfg = _run(client.aget_bank_config(_config.bank_id))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error(f"Access to bank {_config.bank_id!r}", exc) from exc
 
@@ -415,7 +446,7 @@ def retain_interaction(
         document_id=doc_id,
     )
     try:
-        resp = client.retain(
+        resp = _run(client.aretain(
             bank_id=bid,
             content=item["content"],
             timestamp=item["timestamp"],
@@ -424,7 +455,7 @@ def retain_interaction(
             metadata=item["metadata"],
             tags=item["tags"],
             update_mode="replace",
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Retain", exc) from exc
 
@@ -464,7 +495,7 @@ def recall_customer_memory(
         f"which channels and contacts worked, what backfired, disputes, promises and payments."
     )
     try:
-        resp = client.recall(
+        resp = _run(client.arecall(
             bank_id=bid,
             query=q,
             types=list(types) if types else None,
@@ -472,7 +503,7 @@ def recall_customer_memory(
             budget=budget,
             tags=tags,
             tags_match="all_strict",
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Recall", exc) from exc
 
@@ -505,7 +536,7 @@ def list_seeded_document_ids() -> set[str]:
     offset, page = 0, 200
     try:
         while True:
-            resp = _run_async(client.documents.list_documents(bid, q=SEED_DOC_PREFIX, limit=page, offset=offset))
+            resp = _run(client.documents.list_documents(bid, q=SEED_DOC_PREFIX, limit=page, offset=offset))
             items = getattr(resp, "items", None) or []
             found.update(d.id for d in items if str(d.id).startswith(SEED_DOC_PREFIX))
             if len(items) < page:
@@ -567,7 +598,7 @@ def seed_customer_history(
     for start in range(0, len(items), batch_size):
         chunk = items[start : start + batch_size]
         try:
-            resp = client.retain_batch(bank_id=bid, items=chunk)
+            resp = _run(client.aretain_batch(bank_id=bid, items=chunk))
         except Exception as exc:  # noqa: BLE001
             summary["sent"] = sent
             raise _wrap_api_error(f"Seeding batch starting at item {start}", exc) from exc
@@ -581,7 +612,7 @@ def delete_document(document_id: str) -> bool:
     client = get_client()
     bid = bank_id()
     try:
-        _run_async(client.documents.delete_document(bid, document_id))
+        _run(client.documents.delete_document(bid, document_id))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error(f"Deleting document {document_id!r}", exc) from exc
     return True
@@ -639,12 +670,12 @@ def configure_bank() -> dict[str, Any]:
     client = get_client()
     bid = bank_id()
     try:
-        result = client.update_bank_config(
+        result = _run(client.aupdate_bank_config(
             bid,
             observations_mission=OBSERVATIONS_MISSION,
             reflect_mission=REFLECT_MISSION,
             **BANK_DISPOSITION,
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Bank configuration update", exc) from exc
     return result.get("overrides", result) if isinstance(result, dict) else {}
@@ -654,7 +685,7 @@ def get_bank_overrides() -> dict[str, Any]:
     """Return the bank-level configuration overrides currently stored in Hindsight."""
     client = get_client()
     try:
-        cfg = client.get_bank_config(bank_id())
+        cfg = _run(client.aget_bank_config(bank_id()))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Reading bank configuration", exc) from exc
     return cfg.get("overrides", {}) if isinstance(cfg, dict) else {}
@@ -672,7 +703,7 @@ def wait_for_operation(operation_id: str | None, timeout: float = 300.0, poll: f
     last: dict[str, Any] = {}
     while True:
         try:
-            st = _run_async(client.operations.get_operation_status(bid, operation_id))
+            st = _run(client.operations.get_operation_status(bid, operation_id))
         except Exception as exc:  # noqa: BLE001
             raise _wrap_api_error(f"Checking operation {operation_id}", exc) from exc
         last = {
@@ -699,8 +730,8 @@ def rebuild_observations(wait: bool = True) -> dict[str, Any]:
     client = get_client()
     bid = bank_id()
     try:
-        _run_async(client.banks.clear_observations(bid))
-        resp = _run_async(client.banks.trigger_consolidation(bid))
+        _run(client.banks.clear_observations(bid))
+        resp = _run(client.banks.trigger_consolidation(bid))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Rebuilding observations", exc) from exc
     op_id = getattr(resp, "operation_id", None)
@@ -731,7 +762,7 @@ def ensure_customer_playbook(customer_id: str, customer_name: str | None = None,
             customer_name = customer_id
 
     try:
-        existing = client.list_mental_models(bid, tags=[f"customer:{customer_id}"], detail="metadata")
+        existing = _run(client.alist_mental_models(bid, tags=[f"customer:{customer_id}"], detail="metadata"))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Listing mental models", exc) from exc
     for m in getattr(existing, "items", None) or []:
@@ -746,14 +777,14 @@ def ensure_customer_playbook(customer_id: str, customer_name: str | None = None,
     # memories, so only the customer tag goes here (an extra "kind" tag would
     # leave reflect with no sources in scope).
     try:
-        resp = client.create_mental_model(
+        resp = _run(client.acreate_mental_model(
             bid,
             name=f"{customer_name} collection playbook",
             source_query=source_query,
             tags=[f"customer:{customer_id}"],
             trigger={"refresh_after_consolidation": True},
             id=mid,
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Creating mental model", exc) from exc
     op_id = getattr(resp, "operation_id", None)
@@ -769,7 +800,7 @@ def refresh_customer_playbook(customer_id: str, wait: bool = True) -> dict[str, 
     bid = bank_id()
     mid = playbook_model_id(customer_id)
     try:
-        resp = client.refresh_mental_model(bid, mid)
+        resp = _run(client.arefresh_mental_model(bid, mid))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error(f"Refreshing mental model {mid!r}", exc) from exc
     op_id = getattr(resp, "operation_id", None)
@@ -785,7 +816,7 @@ def get_customer_playbook(customer_id: str) -> dict[str, Any]:
     bid = bank_id()
     mid = playbook_model_id(customer_id)
     try:
-        m = client.get_mental_model(bid, mid, detail="content")
+        m = _run(client.aget_mental_model(bid, mid, detail="content"))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error(f"Reading mental model {mid!r}", exc) from exc
     content = (getattr(m, "content", None) or "").strip()
@@ -820,7 +851,7 @@ def reflect_customer(
     client = get_client()
     bid = bank_id()
     try:
-        resp = client.reflect(
+        resp = _run(client.areflect(
             bank_id=bid,
             query=query,
             budget=budget,
@@ -830,7 +861,7 @@ def reflect_customer(
             tags=[f"customer:{customer_id}"],
             tags_match="all_strict",
             include_facts=True,
-        )
+        ))
     except Exception as exc:  # noqa: BLE001
         raise _wrap_api_error("Reflect", exc) from exc
 
