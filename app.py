@@ -107,17 +107,40 @@ def result_key(invoice_id: str, memory_enabled: bool) -> str:
 # Rendering
 # --------------------------------------------------------------------------- #
 
+INVOICE_CARD_CSS = """
+<style>
+.pr-grid {display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; margin: 0.25rem 0 0.75rem 0;}
+@media (max-width: 900px) {.pr-grid {grid-template-columns: repeat(2, minmax(0, 1fr));}}
+.pr-card {background: var(--secondary-background-color); border: 1px solid rgba(128, 128, 128, 0.25);
+          border-radius: 0.5rem; padding: 0.7rem 0.9rem; min-width: 0;}
+.pr-label {font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.7; margin-bottom: 0.2rem;}
+.pr-value {font-size: 1.35rem; font-weight: 600; line-height: 1.3; color: var(--text-color); overflow-wrap: anywhere;}
+.pr-desc {font-size: 1.05rem; line-height: 1.55; color: var(--text-color); opacity: 0.92; margin: 0.25rem 0 0.5rem 0;}
+</style>
+"""
+
+
 def render_invoice(customer: dict[str, Any], invoice: dict[str, Any]) -> None:
+    """Six facts in a 3x2 grid of cards that wrap instead of truncating (st.metric clips long values)."""
+    import html
+
     st.subheader("Selected invoice")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Customer", customer["name"])
-    c2.metric("Invoice", invoice["invoice_id"])
-    c3.metric("Amount", money(invoice.get("balance_due", invoice.get("amount"))))
-    c4.metric("Due date", invoice.get("due_date", "-"))
-    c5.metric("Days overdue", invoice.get("days_overdue", "-"))
-    c6.metric("Status", str(invoice.get("status", "-")).title())
+    fields = [
+        ("Customer", customer["name"]),
+        ("Invoice", invoice["invoice_id"]),
+        ("Amount", money(invoice.get("balance_due", invoice.get("amount")))),
+        ("Due date", invoice.get("due_date", "-")),
+        ("Days overdue", invoice.get("days_overdue", "-")),
+        ("Status", str(invoice.get("status", "-")).title()),
+    ]
+    cards = "".join(
+        f'<div class="pr-card"><div class="pr-label">{html.escape(str(label))}</div>'
+        f'<div class="pr-value">{html.escape(str(value))}</div></div>'
+        for label, value in fields
+    )
+    st.markdown(INVOICE_CARD_CSS + f'<div class="pr-grid">{cards}</div>', unsafe_allow_html=True)
     if invoice.get("description"):
-        st.caption(invoice["description"])
+        st.markdown(f'<p class="pr-desc">{html.escape(invoice["description"])}</p>', unsafe_allow_html=True)
 
 
 def render_recommendation(rec: agent.Recommendation, *, compact: bool = False) -> None:
