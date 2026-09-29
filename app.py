@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import re
+import time
+from datetime import date
 from typing import Any
 
 import streamlit as st
@@ -32,6 +34,18 @@ COMPARE_FIELDS = (
     ("suggested_timing", "Timing"),
     ("approach", "Approach"),
 )
+
+# Outcome form choices -> the outcome tag stored in Hindsight (same vocabulary as the seed data)
+RESOLUTIONS = {
+    "Promise to Pay": "promise",
+    "Paid": "paid",
+    "Disputed": "dispute",
+    "Ignored": "ignored",
+    "Partial Payment": "partial",
+    "Other": "none",
+}
+NEW_MEMORY_POLL_ATTEMPTS = 4
+NEW_MEMORY_POLL_SECONDS = 2.0
 
 # --------------------------------------------------------------------------- #
 # Data helpers (read-only)
@@ -221,6 +235,196 @@ def render_comparison(off: agent.Recommendation, on: agent.Recommendation, custo
 
 
 # --------------------------------------------------------------------------- #
+# Live outcome learning
+# --------------------------------------------------------------------------- #
+
+def learning_key(invoice_id: str) -> str:
+    return f"learning::{invoice_id}"
+
+
+def find_new_memories(customer_id: str, document_ids: list[str], probe_text: str) -> list[dict[str, Any]]:
+    """Poll recall until the memories extracted from the new documents are retrievable."""
+    wanted = set(document_ids)
+    for attempt in range(NEW_MEMORY_POLL_ATTEMPTS):
+        hits = hm.recall_customer_memory(customer_id, query=probe_text, budget="low", max_tokens=1500)
+        found = [h for h in hits if h.get("document_id") in wanted]
+        if found:
+            return found
+        if attempt < NEW_MEMORY_POLL_ATTEMPTS - 1:
+            time.sleep(NEW_MEMORY_POLL_SECONDS)
+    return []
+
+
+def log_outcome(customer: dict[str, Any], invoice: dict[str, Any], rec: agent.Recommendation,
+                reply_text: str, resolution: str, outcome_date: date) -> dict[str, Any]:
+    """Retain the action and the customer's reply, refresh the playbook, re-recommend.
+
+    Raises hm.HindsightConfigError / hm.HindsightAPIError / agent.AgentError; the caller
+    turns those into friendly messages. Nothing here touches customers.json.
+    """
+    outcome = RESOLUTIONS.get(resolution, "none")
+    cid, inv_id = customer["id"], invoice["invoice_id"]
+    warnings: list[str] = []
+
+    action_narrative = (
+        f"Following PayRecall's recommendation, the collections agent contacted {rec.recipient} "
+        f"via {rec.channel} using a {rec.tone} tone regarding invoice {inv_id}. "
+        f"Approach: {rec.approach} Timing: {rec.suggested_timing}"
+    )
+    action_doc = hm.retain_interaction(
+        customer_id=cid, customer_name=customer["name"], invoice_id=inv_id,
+        channel=rec.channel, contact=rec.recipient, tone=rec.tone, actor="agent",
+        interaction_date=outcome_date, outcome=outcome, narrative=action_narrative,
+    )
+    reply_doc = hm.retain_interaction(
+        customer_id=cid, customer_name=customer["name"], invoice_id=inv_id,
+        channel=rec.channel, contact=rec.recipient, actor="customer",
+        interaction_date=outcome_date, outcome=outcome,
+        narrative=f"Customer response ({resolution}): {reply_text.strip()}",
+    )
+    doc_ids = [action_doc["document_id"], reply_doc["document_id"]]
+
+    new_memories = find_new_memories(cid, doc_ids, reply_text)
+    if not new_memories:
+        warnings.append("The new outcome was stored, but Hindsight had not finished indexing it when the recommendation was regenerated.")
+
+    playbook_refreshed = False
+    try:
+        hm.refresh_customer_playbook(cid, wait=True)
+        playbook_refreshed = True
+    except hm.HindsightAPIError as exc:
+        warnings.append(f"Playbook could not be refreshed ({str(exc)[:70]}).")
+
+    # Drop anything cached for this customer/invoice so the re-run cannot show stale results.
+    load_playbook.clear()
+    st.session_state.pop(result_key(inv_id, True), None)
+
+    after = agent.recommend(customer, invoice, memory_enabled=True)
+    st.session_state[result_key(inv_id, True)] = after
+
+    return {
+        "before": rec,
+        "after": after,
+        "outcome": {"resolution": resolution, "outcome_tag": outcome, "date": outcome_date.isoformat(), "text": reply_text.strip()},
+        "document_ids": doc_ids,
+        "new_memories": new_memories,
+        "playbook_refreshed": playbook_refreshed,
+        "warnings": warnings,
+    }
+
+
+def render_outcome_form(customer: dict[str, Any], invoice: dict[str, Any], rec: agent.Recommendation) -> None:
+    st.markdown("### Log Customer Outcome")
+    st.caption("Record what happened after this action. PayRecall retains it in Hindsight and re-plans.")
+    processing = st.session_state.get("outcome_processing", False)
+    with st.form(key=f"outcome_form::{invoice['invoice_id']}", clear_on_submit=False):
+        reply_text = st.text_area(
+            "Customer reply / outcome",
+            placeholder="e.g. Kavita confirmed that Meridian will pay the invoice on 5 October.",
+            height=90,
+        )
+        c1, c2 = st.columns(2)
+        resolution = c1.selectbox("Resolution", list(RESOLUTIONS.keys()), index=0)
+        outcome_date = c2.date_input("Outcome date", value=date.today())
+        submitted = st.form_submit_button("Submit outcome and re-plan", type="primary", disabled=processing)
+
+    if not submitted:
+        return
+    if not reply_text.strip():
+        st.warning("Please describe the customer's reply or outcome before submitting.")
+        return
+    fingerprint = f"{invoice['invoice_id']}|{reply_text.strip()}|{resolution}|{outcome_date.isoformat()}"
+    if st.session_state.get("last_outcome_fingerprint") == fingerprint:
+        st.info("This outcome was already recorded. Change the text or date to log a new one.")
+        return
+
+    st.session_state["outcome_processing"] = True
+    try:
+        with st.spinner("Retaining outcome in Hindsight, refreshing the playbook and re-planning..."):
+            entry = log_outcome(customer, invoice, rec, reply_text, resolution, outcome_date)
+        st.session_state["last_outcome_fingerprint"] = fingerprint
+        st.session_state[learning_key(invoice["invoice_id"])] = entry
+        st.session_state["view"] = ("learning", invoice["invoice_id"])
+    except hm.HindsightConfigError as exc:
+        st.error(f"Configuration problem: {exc}")
+    except hm.HindsightAPIError as exc:
+        st.error(f"Hindsight could not store or refresh the memory. {exc}")
+    except agent.AgentError as exc:
+        st.error(f"The outcome was stored, but the new recommendation failed. {exc}")
+    except Exception as exc:  # noqa: BLE001 - never leak a stack trace
+        log.exception("Unexpected error while logging an outcome")
+        st.error(f"Unexpected error ({type(exc).__name__}). The previous recommendation is still shown above.")
+    finally:
+        st.session_state["outcome_processing"] = False
+
+
+def render_learning(entry: dict[str, Any], customer_id: str) -> None:
+    before: agent.Recommendation = entry["before"]
+    after: agent.Recommendation = entry["after"]
+    outcome = entry["outcome"]
+    new_ids = {m.get("id") for m in entry["new_memories"]}
+
+    st.success("**PayRecall learned from this outcome**", icon="🎓")
+    with st.container(border=True):
+        st.markdown(f"**Recorded outcome:** {outcome['resolution']} · {outcome['date']}")
+        st.write(outcome["text"])
+        st.caption("Stored in Hindsight as documents: " + ", ".join(f"`{d}`" for d in entry["document_ids"]))
+        if entry["new_memories"]:
+            st.markdown("**New memories extracted from this outcome (now retrievable):**")
+            for m in entry["new_memories"]:
+                st.markdown(f"🆕 `{m.get('type', 'memory')}` {m.get('text', '')}")
+        st.caption(
+            "Playbook refreshed from memory." if entry["playbook_refreshed"] else "Playbook was not refreshed."
+        )
+        for w in entry["warnings"]:
+            st.caption(f"⚠️ {w}")
+
+    st.markdown("### Before vs after learning")
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("#### BEFORE LEARNING")
+        st.caption("Recommendation from seeded history only")
+        render_recommendation(before, compact=True)
+    with right:
+        st.markdown("#### AFTER LEARNING")
+        st.caption("Recommendation after retaining the new outcome")
+        render_recommendation(after, compact=True)
+        used_new = [m for m in after.supporting_memories if m.get("id") in new_ids]
+        if used_new:
+            st.info(f"The updated recommendation cites {len(used_new)} memory(ies) created from the outcome you just logged.", icon="🆕")
+
+    st.markdown("### What changed because PayRecall learned?")
+    diffs = diff_recommendations(before, after)
+    conf_changed = round(before.confidence, 2) != round(after.confidence, 2)
+    diffs.append({"field": "Confidence", "key": "confidence", "off": f"{before.confidence:.0%}", "on": f"{after.confidence:.0%}", "changed": conf_changed})
+    changed = [d["field"] for d in diffs if d["changed"]]
+    if changed:
+        st.success(f"Changed after learning: **{', '.join(changed)}**.")
+    else:
+        st.info("The recommendation did not change. The outcome confirmed what PayRecall already believed.")
+    for d in diffs:
+        icon = "🔁" if d["changed"] else "✅"
+        c0, c1, c2 = st.columns([1, 3, 3])
+        c0.markdown(f"{icon} **{d['field']}**")
+        c1.caption("BEFORE")
+        c1.write(d["off"])
+        c2.caption("AFTER")
+        c2.write(d["on"])
+
+    st.divider()
+    st.markdown("#### What PayRecall remembers now")
+    for m in after.supporting_memories:
+        badge = "🆕 " if m.get("id") in new_ids else ""
+        when = f" · {m['date']}" if m.get("date") else ""
+        with st.container(border=True):
+            st.markdown(f"{badge}**[{m.get('ref', '?')}]** `{m.get('type', 'memory')}`{when}")
+            st.write(m.get("text", ""))
+    pb = load_playbook(customer_id)
+    with st.expander("Updated customer playbook", expanded=False):
+        st.markdown(pb["content"] if pb else "No playbook has been learned for this customer yet.")
+
+
+# --------------------------------------------------------------------------- #
 # Page
 # --------------------------------------------------------------------------- #
 
@@ -280,6 +484,7 @@ def main() -> None:
 
     view = st.session_state.get("view")
     if view and view[1] == invoice["invoice_id"]:
+        on_rec = st.session_state.get(result_key(invoice["invoice_id"], True))
         if view[0] == "single":
             rec = st.session_state.get(result_key(invoice["invoice_id"], view[2]))
             if rec:
@@ -287,12 +492,23 @@ def main() -> None:
                 if rec.memory_used:
                     st.divider()
                     render_memories(rec, customer["id"])
-        else:
+        elif view[0] == "compare":
             off = st.session_state.get(result_key(invoice["invoice_id"], False))
-            on = st.session_state.get(result_key(invoice["invoice_id"], True))
-            if off and on:
+            if off and on_rec:
                 st.markdown("### MEMORY OFF vs MEMORY ON — same invoice, same LLM")
-                render_comparison(off, on, customer["id"])
+                render_comparison(off, on_rec, customer["id"])
+        elif view[0] == "learning":
+            entry = st.session_state.get(learning_key(invoice["invoice_id"]))
+            if entry:
+                render_learning(entry, customer["id"])
+                on_rec = entry["after"]
+        # Outcome logging is offered whenever a MEMORY ON recommendation is on screen.
+        if on_rec and (view[0] != "single" or view[2]):
+            st.divider()
+            render_outcome_form(customer, invoice, on_rec)
+            # A successful submit switches the view; show it immediately without a manual rerun.
+            if st.session_state.get("view", view) != view:
+                st.rerun()
     else:
         st.info("Choose a customer and invoice, then generate a recommendation or compare both modes.")
 
